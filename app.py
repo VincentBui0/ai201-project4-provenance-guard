@@ -3,6 +3,8 @@ import json
 import datetime
 import os
 import sqlite3
+import re
+import math
 
 from flask import Flask, request, jsonify
 from dotenv import load_dotenv
@@ -21,23 +23,23 @@ def init_db():
     conn = sqlite3.connect("audit.db")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS log (
-            content_id  TEXT,
-            creator_id  TEXT,
-            timestamp   TEXT,
-            attribution TEXT,
-            confidence  REAL,
-            llm_score   REAL,
-            status      TEXT
+            content_id        TEXT,
+            creator_id        TEXT,
+            timestamp         TEXT,
+            attribution       TEXT,
+            confidence        REAL,
+            llm_score         REAL,
+            stylometric_score REAL,
+            status            TEXT
         )
     """)
     conn.commit()
     conn.close()
 
-
 def write_log(entry: dict):
     conn = sqlite3.connect("audit.db")
     conn.execute(
-        "INSERT INTO log VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO log VALUES (?,?,?,?,?,?,?,?)",
         (
             entry["content_id"],
             entry["creator_id"],
@@ -45,12 +47,12 @@ def write_log(entry: dict):
             entry["attribution"],
             entry["confidence"],
             entry["llm_score"],
+            entry["stylometric_score"],
             entry["status"],
         ),
     )
     conn.commit()
     conn.close()
-
 
 def get_log(n: int = 20) -> list[dict]:
     conn = sqlite3.connect("audit.db")
@@ -59,7 +61,7 @@ def get_log(n: int = 20) -> list[dict]:
     ).fetchall()
     conn.close()
     cols = ["content_id", "creator_id", "timestamp", "attribution",
-            "confidence", "llm_score", "status"]
+            "confidence", "llm_score", "stylometric_score", "status"]
     return [dict(zip(cols, row)) for row in rows]
 
 
@@ -98,7 +100,58 @@ def llm_classify(text: str) -> float:
         print(f"[llm_classify] Raw output was: {raw!r}")
         # Return 0.5 (maximally uncertain) so the submission doesn't hard-fail
         return 0.5
+    
+# ---------------------------------------------------------------------------
+# Signal 2: Stylometric heuristics
+# ---------------------------------------------------------------------------
+ 
+def stylometric_score(text: str) -> float:
+    sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
+    if not sentences:
+        return 0.5
 
+    word_counts = [len(s.split()) for s in sentences]
+    words = text.split()
+    total_words = len(words)
+
+    # 1. Sentence length variance (AI = uniform = low std_dev = high score)
+    if len(word_counts) > 1:
+        mean_wc = sum(word_counts) / len(word_counts)
+        variance = sum((wc - mean_wc) ** 2 for wc in word_counts) / len(word_counts)
+        std_dev = math.sqrt(variance)
+    else:
+        std_dev = 0.0
+
+    slv_score = max(0.0, 1.0 - (std_dev / 6.0))
+
+    # 2. Punctuation density (AI = conservative = low punct = high score)
+    if total_words > 0:
+        punct_chars = len(re.findall(r'[,;:\-—–…!?]', text))
+        punct_per_100 = (punct_chars / total_words) * 100
+    else:
+        punct_per_100 = 0.0
+
+    punct_score = max(0.0, 1.0 - (punct_per_100 / 8.0))
+
+    # 3. Avg sentence length (AI tends toward longer, more complete sentences)
+    mean_wc = sum(word_counts) / len(word_counts) if word_counts else 10
+    # Normalize: short sentences (< 8 words) = human-like; long (20+) = AI-like
+    avg_len_score = min(1.0, max(0.0, (mean_wc - 8) / 12.0))
+
+    combined = (0.5 * slv_score) + (0.3 * punct_score) + (0.2 * avg_len_score)
+    return round(min(1.0, max(0.0, combined)), 4)
+ 
+ 
+# ---------------------------------------------------------------------------
+# Confidence scoring
+# ---------------------------------------------------------------------------
+ 
+def combine_scores(llm_score: float, stylo_score: float, word_count: int) -> float:
+    raw = (0.7 * llm_score) + (0.3 * stylo_score)
+    clamped = min(1.0, max(0.0, raw))
+    if word_count < 50:
+        clamped = min(clamped, 0.70)
+    return round(clamped, 4)
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -119,12 +172,15 @@ def submit():
         return jsonify({"error": "Missing required field: creator_id"}), 400
 
     content_id = str(uuid.uuid4())
-    llm_score = llm_classify(text)
+    word_count = len(text.split())
 
-    # Placeholder attribution based on llm_score alone (M4 adds the weighted score)
-    if llm_score >= 0.65:
+    llm = llm_classify(text)
+    stylo = stylometric_score(text)
+    confidence = combine_scores(llm, stylo, word_count)
+
+    if confidence >= 0.65:
         attribution = "likely_ai"
-    elif llm_score >= 0.36:
+    elif confidence >= 0.36:
         attribution = "uncertain"
     else:
         attribution = "likely_human"
@@ -134,8 +190,9 @@ def submit():
         "creator_id": creator_id,
         "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
         "attribution": attribution,
-        "confidence": llm_score,   # placeholder — M4 replaces with weighted score
-        "llm_score": llm_score,
+        "confidence": confidence,
+        "llm_score": llm,
+        "stylometric_score": stylo,
         "status": "classified",
     }
     write_log(entry)
@@ -143,7 +200,9 @@ def submit():
     return jsonify({
         "content_id": content_id,
         "attribution": attribution,
-        "confidence": llm_score,
+        "confidence": confidence,
+        "llm_score": llm,
+        "stylometric_score": stylo,
         "label": "TBD in M5",
     })
 
